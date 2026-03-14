@@ -22,7 +22,8 @@ npx skills add leap21ai/djx-spark-skill
 | **SGLang** | Official spark container, EAGLE3 speculative decoding (2x throughput) |
 | **Training** | SFT/DPO/GRPO recipes with cgroup memory jails, batch size memory budget tables, estimation formulas |
 | **Benchmarks** | Official llama.cpp data for 6 models, context degradation curves, SGLang numbers, dual-node results |
-| **Advanced** | PyTorch from source, Triton from source, compiler flags, systemd service template, env var reference |
+| **Systemd Service** | Production service template, WatchdogSec incompatibility warning, CPUAffinity guidance, load time expectations by model/ctx size |
+| **Advanced** | PyTorch from source, Triton from source, compiler flags, `nvidia-smi` UMA query gotchas, env var reference |
 
 ## Why This Exists
 
@@ -35,6 +36,8 @@ Without this skill, Claude gives **generic NVIDIA advice** that causes real prob
 | `pip install vllm` fails | "Fix LD_LIBRARY_PATH" (wrong — .so.12 doesn't exist) | CUDA 13 ABI break, cu130 wheels, NGC container |
 | Attention implementation | "Use flash_attention_2" (crashes on sm_121) | "Never flash_attention_2 — use SDPA" |
 | nvidia-smi shows "Not Supported" | Suggests tegrastats (wrong tool) | Explains UMA, `free -h`, drop caches, `--mlock` |
+| systemd WatchdogSec | "Add watchdog for health check" (causes kill loop) | "Never WatchdogSec — llama-server has no sd_notify" |
+| CPUAffinity | Pin to subset of cores | "Use all 20 cores — don't restrict to efficiency cores" |
 
 ## Hardware Quick Reference
 

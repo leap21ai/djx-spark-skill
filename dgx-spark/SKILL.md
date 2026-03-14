@@ -5,7 +5,7 @@ description: >
   Use when building, deploying, training, or running inference on DGX Spark hardware —
   covers CUDA 13.0 compatibility, unified memory architecture, llama.cpp builds,
   vLLM/SGLang setup, OOM prevention, and performance optimization.
-version: 1.0.0
+version: 1.1.0
 author: Trey Anderson
 tags: [nvidia, dgx-spark, gb10, blackwell, cuda-13, aarch64, llama-cpp, vllm, inference, training]
 ---
@@ -266,8 +266,11 @@ Optional: install **Dropbear** on port 2222 as a backup SSH daemon (~500 KB, sur
 
 #### Layer 4: earlyoom Watchdog
 
+**earlyoom is NOT preinstalled on DGX Spark** — you must install and enable it:
+
 ```bash
-sudo apt install earlyoom
+sudo apt install -y earlyoom
+sudo systemctl enable --now earlyoom
 # Configure: 3% RAM / 10% swap thresholds
 # Protect: systemd, SSH, journald
 # Kill targets: vllm, python, triton
@@ -896,6 +899,35 @@ make -j"$(nproc)"
 
 ## Systemd Service Template (llama.cpp Inference)
 
+### Critical: No WatchdogSec
+
+**NEVER use `WatchdogSec` with llama-server.** llama-server does not send `sd_notify` watchdog pings, so systemd will kill the process after the timeout expires — even if it's healthy. On large models (77GB+) with big context windows (131K+), the initial load can take 2-5 minutes, causing a **restart loop** (observed: 110 restarts in production before diagnosis). Use `Restart=on-failure` without any watchdog.
+
+### CPUAffinity: Use All 20 Cores
+
+Do **not** pin llama-server to a subset of cores (e.g., `CPUAffinity=10-19`). The GB10 has 10 performance cores (Cortex-X925, cores 0-9) and 10 efficiency cores (Cortex-A725, cores 10-19). Pinning to efficiency cores only halves throughput. Either omit `CPUAffinity` entirely (recommended) or set `CPUAffinity=0-19`.
+
+### Load Time Expectations
+
+Model load time depends on more than just the GGUF file size. The q8_0 KV cache for large context windows adds significant allocation time:
+
+| Config | Approximate Load Time (kernel 6.17) |
+|--------|--------------------------------------|
+| 7B model, 32K ctx | ~5s |
+| 30B model, 43K ctx | ~15s |
+| 77GB model, 32K ctx | ~22s |
+| 77GB model, 131K ctx, q8_0 KV | **2-3 minutes** |
+
+### nvidia-smi on UMA
+
+`nvidia-smi --query-gpu=memory.used,memory.total` returns `[N/A]` on DGX Spark (no dedicated VRAM). To check GPU memory per process, use:
+
+```bash
+nvidia-smi --query-compute-apps=pid,used_memory,name --format=csv,noheader
+```
+
+### Template
+
 ```ini
 [Unit]
 Description=llama.cpp server (%i) on DGX Spark
@@ -904,6 +936,8 @@ After=network.target
 [Service]
 Type=simple
 User=nvidia
+# Do NOT set WatchdogSec — llama-server has no sd_notify support
+# Do NOT set CPUAffinity to a core subset — use all 20 cores
 ExecStart=/usr/local/bin/llama-server \
     -m /models/%i.gguf \
     -ngl 99 \
