@@ -17,13 +17,15 @@ npx skills add leap21ai/djx-spark-skill
 | **CUDA 13.0 Compatibility** | Fix `libcudart.so.12` errors, cu130 wheel install, cross-platform pyproject.toml, full package compatibility matrix |
 | **Unified Memory (128 GB)** | Zero-copy architecture rules, safetensors double-load bug, buffer cache competition, cudaMemGetInfo gotchas |
 | **OOM Prevention** | 5-layer defense against the swap death spiral (the #1 reported issue) — disable swap, cgroups, SSH protection, earlyoom, memory watchdog |
-| **llama.cpp Builds** | GPU build (sm_121 targeting) and CPU build (ARMv9-A SVE2/BF16/I8MM), optimal runtime flags, `--no-mmap` critical perf note |
+| **llama.cpp Builds** | GPU build (sm_121 targeting), CPU build (ARMv9-A SVE2/BF16/I8MM), NVFP4 build (`121f`), optimal runtime flags, `-fit off` for MoE, `--no-mmap` critical perf note |
+| **Multi-Node Clustering** | ConnectX-7 RoCE v2 fabric, llama.cpp RPC backend, NCCL over RoCE, RDMA verification, netplan config |
 | **vLLM Setup** | 4 install paths — NGC container, cu130 wheels, one-command installer, from-source. MOE kernel fixes |
 | **SGLang** | Official spark container, EAGLE3 speculative decoding (2x throughput) |
 | **Training** | SFT/DPO/GRPO recipes with cgroup memory jails, batch size memory budget tables, estimation formulas |
 | **Benchmarks** | Official llama.cpp data for 6 models, context degradation curves, SGLang numbers, dual-node results |
 | **Systemd Service** | Production service template, WatchdogSec incompatibility warning, CPUAffinity guidance, load time expectations by model/ctx size |
-| **Advanced** | PyTorch from source, Triton from source, compiler flags, `nvidia-smi` UMA query gotchas, env var reference |
+| **Why NOT Ollama** | Overhead analysis — Go runtime, no UMA flags, no RPC support, no direct GPU control |
+| **Advanced** | PyTorch from source, Triton from source, compiler flags, `nvidia-smi` per-process GPU query, env var reference, kernel 6.17 upgrade |
 
 ## Why This Exists
 
@@ -38,6 +40,8 @@ Without this skill, Claude gives **generic NVIDIA advice** that causes real prob
 | nvidia-smi shows "Not Supported" | Suggests tegrastats (wrong tool) | Explains UMA, `free -h`, drop caches, `--mlock` |
 | systemd WatchdogSec | "Add watchdog for health check" (causes kill loop) | "Never WatchdogSec — llama-server has no sd_notify" |
 | CPUAffinity | Pin to subset of cores | "Use all 20 cores — don't restrict to efficiency cores" |
+| Multi-node inference | "Use NCCL with mpirun" (wrong for llama.cpp) | llama.cpp RPC backend with `-DGGML_RPC=ON`, ConnectX-7 RoCE v2 |
+| Ollama for inference | "Install Ollama for easy setup" | "Never Ollama — Go overhead, no UMA flags, no RPC, use llama.cpp directly" |
 
 ## Hardware Quick Reference
 

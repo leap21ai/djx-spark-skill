@@ -15,7 +15,7 @@ tags: [nvidia, dgx-spark, gb10, blackwell, cuda-13, aarch64, llama-cpp, vllm, in
 ## When to Use This Skill
 
 - Building or compiling **any** software targeting DGX Spark (GB10, sm_121, CUDA 13.0)
-- Running LLM inference on DGX Spark (llama.cpp, vLLM, SGLang, Ollama)
+- Running LLM inference on DGX Spark (llama.cpp, vLLM, SGLang)
 - Training or fine-tuning models on DGX Spark (SFT, DPO, GRPO, LoRA)
 - Diagnosing OOM freezes, swap death spirals, or unresponsive SSH on DGX Spark
 - Setting up Docker containers for GPU workloads on DGX Spark
@@ -88,6 +88,12 @@ uname -r
 GPU: NVIDIA GB10 (On, Persistence-M)
 Driver Version: 580.95.05      CUDA Version: 13.0
 Memory-Usage: Not Supported
+```
+
+**GPU memory per process** (since `nvidia-smi` total memory shows N/A on UMA):
+
+```bash
+nvidia-smi --query-compute-apps=pid,used_memory,name --format=csv,noheader
 ```
 
 ---
@@ -345,6 +351,31 @@ make -j"$(nproc)"
 
 Build completes in 2-4 minutes.
 
+### NVFP4 Native Build (For MXFP4 Models)
+
+For models using NVIDIA's native FP4 quantization (NVFP4/MXFP4), use the `121f` architecture suffix to enable Blackwell's native `m16n8k64` MXFP4 tensor core instructions. The `f` suffix activates the `BLACKWELL_NATIVE_FP4` codepath internally — it is NOT a separate cmake flag:
+
+```bash
+mkdir -p build-gpu-fp4 && cd build-gpu-fp4
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_CUDA=ON \
+    -DGGML_CUDA_F16=ON \
+    -DCMAKE_CUDA_ARCHITECTURES="121f" \
+    -DCMAKE_C_COMPILER=gcc \
+    -DCMAKE_CXX_COMPILER=g++ \
+    -DCMAKE_CUDA_COMPILER=nvcc
+
+make -j"$(nproc)"
+```
+
+**When to use `121f` vs `121`:**
+- `121f`: MXFP4-quantized models (e.g., `gpt-oss-120B MXFP4`). ~25-31% throughput gain, ~40% less memory vs Q8_0
+- `121`: Everything else (Q4_K_M, Q8_0, embedding models). Standard build, no FP4 native path
+- **Do NOT use `121f` for embedding models** (e.g., nomic-embed-text) — higher numerical error degrades embedding quality
+
+Only affects GGUF models with MXFP4/NF4 quantized weights. Standard GGUF quantizations (Q4_K_M, Q8_0, etc.) are unaffected by the `f` suffix.
+
 ### Verify Build
 
 ```bash
@@ -374,6 +405,18 @@ ldd bin/llama-cli | grep cuda
 ```
 
 **`--no-mmap` is critical on DGX Spark** — mmap causes the kernel to manage model pages through the buffer cache, competing with GPU memory. Direct I/O (`--no-mmap`) bypasses this entirely.
+
+### `-fit off` for MoE Models
+
+For Mixture-of-Experts models (e.g., Qwen3.5-35B-A3B, DeepSeek-V3), add `-fit off` to disable llama.cpp's automatic layer-fitting heuristic. The heuristic miscalculates memory for MoE architectures where only a fraction of parameters are active per token, leading to unnecessarily conservative GPU offloading or OOM on models that should fit comfortably.
+
+```bash
+./bin/llama-server -m ~/models/qwen35-35b-a3b-q8.gguf \
+    -ngl 99 --flash-attn --no-mmap --mlock \
+    -fit off \              # REQUIRED for MoE models
+    --parallel 3 --ctx-size 43008 \
+    -ub 2048 -t 20 --host 0.0.0.0 --port 8203
+```
 
 ### Key Build Flags Reference
 
@@ -583,16 +626,16 @@ The `-v /usr/local/cuda:/usr/local/cuda:ro` bind-mount exposes the host CUDA 13 
 docker commit --pause=false <container_id> my-dgx-spark-env:snapshot
 ```
 
-### Ollama (Simplest Path)
+### Why NOT Ollama
 
-```bash
-# Works out of the box on DGX Spark
-ollama run qwen2.5:7b
+**Never use Ollama on DGX Spark.** Ollama adds significant overhead over raw llama.cpp:
+- Extra memory consumption from the Go runtime and model management layer
+- No direct control over `--no-mmap`, `--mlock`, `-ub`, or other UMA-critical flags
+- Slower model loading and higher idle memory usage
+- Cannot use `--rpc` for multi-node distributed inference
+- Ollama's quantization choices and runtime defaults are tuned for consumer GPUs, not GB10
 
-# Recommended env vars
-OLLAMA_MAX_LOADED_MODELS=1      # prevent memory contention on UMA
-OLLAMA_FLASH_ATTENTION=1        # reduce memory footprint
-```
+**Always use llama.cpp directly** (GPU or CPU build), vLLM, or SGLang. These give full control over memory layout, batching, and UMA-specific optimizations that matter on shared-memory architectures.
 
 ---
 
@@ -840,11 +883,146 @@ export LLVM_BUILD_DIR=$(pwd)
 
 ---
 
-## Dual-Node Configuration (256 GB Combined)
+## Multi-Node Clustering
 
-Two DGX Sparks can interconnect via QSFP for 256 GB combined memory, handling models up to 405B in FP4.
+### ConnectX-7 RoCE v2 Interface Setup
 
-### vLLM Dual-Node Benchmarks
+DGX Spark has two QSFP ports (ConnectX-7). Interface names have two forms — always use the `enp1` prefix:
+
+| Canonical name | Alternative name | Notes |
+|---|---|---|
+| `enp1s0f0np0` | `enP2p1s0f0np0` | QSFP port 1 |
+| `enp1s0f1np1` | `enP2p1s0f1np1` | QSFP port 2 |
+
+Discover active ports:
+
+```bash
+ibdev2netdev
+# mlx5_0 port 1 ==> enp1s0f0np0 (Up)
+# mlx5_1 port 1 ==> enp1s0f1np1 (Up)
+
+ibv_devinfo | grep -E "hca_id|state|active_width|active_speed"
+```
+
+### Network Configuration (Netplan)
+
+Create `/etc/netplan/40-cx7.yaml` (chmod 600):
+
+```yaml
+# Per-node — adjust IP per host
+network:
+  version: 2
+  ethernets:
+    enp1s0f1np1:
+      dhcp4: false
+      addresses: [192.168.200.1/24]  # .1 for dgx01, .2 for dgx02, etc.
+      mtu: 9000    # jumbo frames for RoCE
+```
+
+```bash
+sudo chmod 600 /etc/netplan/40-cx7.yaml
+sudo netplan apply
+```
+
+### Verify RDMA
+
+```bash
+# Node 2: start receiver
+ib_write_bw -d mlx5_1 -i 1 --report_gbits
+
+# Node 1: send
+ib_write_bw -d mlx5_1 -i 1 192.168.200.2 --report_gbits
+# Expected: ~190-196 Gb/s on a single 200G port
+```
+
+### llama.cpp RPC Backend (Distributed Inference)
+
+Build with RPC enabled:
+
+```bash
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_CUDA=ON \
+    -DGGML_CUDA_F16=ON \
+    -DCMAKE_CUDA_ARCHITECTURES=121 \
+    -DGGML_RPC=ON \
+    -DCMAKE_C_COMPILER=gcc \
+    -DCMAKE_CXX_COMPILER=g++ \
+    -DCMAKE_CUDA_COMPILER=nvcc
+make -j"$(nproc)"
+```
+
+**Worker nodes** — start `rpc-server` on each contributing Spark:
+
+```bash
+# Bind to cluster fabric interface, NOT 0.0.0.0 (no auth!)
+./bin/rpc-server --host 192.168.200.2 --port 50052
+```
+
+**Main node** — load model with `--rpc` pointing to workers:
+
+```bash
+./bin/llama-server \
+    -m ~/models/large-model.gguf \
+    -ngl 99 \
+    --rpc 192.168.200.2:50052,192.168.200.3:50052 \
+    --flash-attn --no-mmap --mlock \
+    -ub 2048 -t 20 --host 0.0.0.0 --port 8080
+```
+
+llama.cpp splits transformer layers across local GPU + each RPC worker. Each Spark contributes ~119 GB to the aggregate pool.
+
+**Security**: RPC server has **no authentication**. Always bind to `192.168.200.x` (cluster fabric subnet), never to `0.0.0.0`.
+
+### NCCL over RoCE v2 (for vLLM/PyTorch Distributed)
+
+Build NCCL for sm_121:
+
+```bash
+git clone -b v2.28.9-1 https://github.com/NVIDIA/nccl.git ~/nccl/
+cd ~/nccl/
+sudo apt-get install -y libopenmpi-dev
+make -j src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121"
+export NCCL_HOME=$HOME/nccl/build/
+export LD_LIBRARY_PATH="$NCCL_HOME/lib:$LD_LIBRARY_PATH"
+```
+
+Required environment variables for CX-7 200G:
+
+```bash
+export NCCL_SOCKET_IFNAME=enp1s0f1np1
+export NCCL_IB_HCA=mlx5_0:1,mlx5_1:1
+export NCCL_IB_GID_INDEX=3              # RoCE v2 GID
+export NCCL_IB_TC=106                   # DSCP 26 traffic class
+export NCCL_NET_GDR_LEVEL=0             # GB10 does NOT support GPUDirect RDMA
+export NCCL_IB_QPS_PER_CONNECTION=4
+```
+
+Verify with nccl-tests:
+
+```bash
+git clone https://github.com/NVIDIA/nccl-tests.git ~/nccl-tests/
+cd ~/nccl-tests/
+make MPI=1 NCCL_HOME=$HOME/nccl/build/
+
+mpirun -np 2 -H 192.168.200.1:1,192.168.200.2:1 \
+  --mca plm_rsh_agent "ssh -o StrictHostKeyChecking=no" \
+  -x LD_LIBRARY_PATH -x NCCL_SOCKET_IFNAME -x NCCL_IB_HCA \
+  -x NCCL_IB_GID_INDEX -x NCCL_IB_TC -x NCCL_NET_GDR_LEVEL \
+  ~/nccl-tests/build/all_gather_perf -b 16G -e 16G -f 2
+```
+
+### RDMA Software Requirements
+
+DGX Spark ships with `rdma-core` (inbox driver), not full MLNX OFED. For basic clustering, `rdma-core` + jumbo frames + NCCL env vars is sufficient. MLNX OFED is only needed for `mlnx_qos` fine-tuning or `ibdump` tracing.
+
+```bash
+# Check what's installed
+dpkg -l | grep -E "mlnx|rdma|ibverbs"
+ofed_info -s  # empty = inbox driver (fine for basic use)
+```
+
+### Dual-Node Benchmarks
 
 | Model | Config | Throughput |
 |-------|--------|-----------|
@@ -877,8 +1055,40 @@ Two DGX Sparks can interconnect via QSFP for 256 GB combined memory, handling mo
 3. Ensure `--gradient_checkpointing` is enabled for large models
 
 ### llama.cpp slow model loading
-- Upgrade kernel to 6.17+ (load time: 68s → 22s)
+- Upgrade kernel to 6.17+ (load time: 68s → 22s) — see Kernel Upgrade section below
 - Use `--no-mmap` flag
+
+### Kernel 6.17 Upgrade (Recommended)
+
+DGX OS ships kernel 6.11. Kernel 6.17 dramatically improves model load times (68s → 22s for large models).
+
+**Via apt (preferred — Canonical DGX OS repo):**
+
+```bash
+sudo apt update
+sudo apt full-upgrade
+sudo reboot
+uname -r   # expect 6.17.0-1008-generic or similar
+```
+
+**If apt doesn't pull 6.17** (not yet in your subscribed repo):
+
+```bash
+# Ubuntu mainline PPA — arm64 packages
+BASE=https://kernel.ubuntu.com/mainline/v6.17-rc7/arm64
+wget $BASE/linux-image-unsigned-6.17.0-061700rc7-generic_*.deb
+wget $BASE/linux-modules-6.17.0-061700rc7-generic_*.deb
+wget $BASE/linux-headers-6.17.0-061700rc7-generic_*.deb
+sudo dpkg -i linux-*.deb
+sudo update-grub
+sudo reboot
+
+# Rebuild NVIDIA DKMS modules after mainline kernel
+sudo dkms autoinstall
+dkms status   # verify all modules built
+```
+
+**Do NOT use Ubuntu mainline PPA unless apt path fails** — the Canonical DGX kernel includes HWE patches + GB10-specific fixes. The NVIDIA driver (580.x) DKMS module works with any kernel as long as headers are present.
 
 ### CMake stale cache after changing flags
 ```bash
@@ -894,6 +1104,12 @@ make -j"$(nproc)"
 ### vLLM MOE kernel errors (`undefined symbol: _Z20cutlass_moe_mm_sm100`)
 - vLLM CMakeLists.txt missing SM12x in MOE kernel arch list
 - Apply the eelbaz fix or use NGC container
+
+### nomic-embed-text / BERT pooling regression (llama.cpp GPU build)
+- Recent llama.cpp GPU builds (post-NVFP4 commit) have a regression with nomic-bert pooling — embeddings return incorrect values or crash
+- **Workaround**: use a CPU-only build (`llama-server-cpu`) for embedding models like `nomic-embed-text-v1.5`
+- The CPU build is fast enough for embeddings (768-dim, small model) and avoids the regression entirely
+- Track upstream: this is a known issue in ggml BERT attention with sm_121
 
 ---
 
@@ -980,10 +1196,6 @@ export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 
 # vLLM
 export VLLM_USE_FLASHINFER_MXFP4_MOE=1
-
-# Ollama
-export OLLAMA_MAX_LOADED_MODELS=1
-export OLLAMA_FLASH_ATTENTION=1
 ```
 
 ---
